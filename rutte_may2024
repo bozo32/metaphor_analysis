@@ -1,0 +1,241 @@
+#Script for metaphor analysis of the 2020 march speech by Rutte introducing covid using ollama
+# Import necessary libraries
+import requests  # Used for making HTTP requests
+import json      # Used for working with JSON data
+import os        # Used for interacting with the operating system
+import re        # Used for regular expressions, for text manipulation
+import logging   # Used for logging information for debugging
+from nltk.tokenize import sent_tokenize  # Used for sentence tokenization
+import csv       # Used for writing CSV files
+
+# Setup logging to record information about program execution and errors
+logging.basicConfig(filename='processing_log.txt', level=logging.INFO, format='%(asctime)s:%(levelname)s:%(message)s')
+
+# Function to extract text from a text file with different encoding handling
+def extract_text_from_txt(file_path, encoding='utf-8'):
+    """Extracts text from a text file with specified encoding."""
+    logging.info(f"Extracting text from {file_path} with encoding {encoding}")
+    try:
+        with open(file_path, 'r', encoding=encoding) as file:
+            text = file.read()
+        return re.sub('\s+', ' ', text)  # Remove extra whitespaces and return the cleaned text
+    except UnicodeDecodeError as e:
+        logging.error(f"UnicodeDecodeError: {e}. Trying with 'latin-1' encoding.")
+        with open(file_path, 'r', encoding='latin-1') as file:
+            text = file.read()
+        return re.sub('\s+', ' ', text)  # Remove extra whitespaces and return the cleaned text
+
+# Function to chunk text into sentences
+def chunk_text(text):
+    sentences = sent_tokenize(text)
+    return sentences
+
+# Common preamble for prompts
+def get_preamble():
+    return """
+    Definition of a metaphor:
+    Metaphors are instances in text in which a word or phrase is applied to an object or action to which it is not literally applicable. The word or a phrase is called a 'vehicle' and the object or action to which it is applied is called a 'target'. Metaphors work when the vehicle, which is literally appropriate for another context, brings aspects, or connotations, from that source context with it. In a text an author may draw many metaphors from the same context or from a few contexts. These become ‘families’. Authors may use one family of metaphors more in some parts of the document than they do in others. The shift in use of families matters because it changes the nature of connotations that are associated with the text in which they are found. For example, when a politician shifts from conflict to growth metaphors it becomes more natural to think about working together to produce something better.
+    
+    Example of a metaphor:
+    'She is fighting cancer'... In this example, the target is her interaction with cancer, and the vehicle is 'fighting', which is literally meaningful in a context where there is actual combat taking place in which people intentionally pound on each other. This use may bring the connotation that she is actually doing something active to push back, to 'defeat' cancer. In this case the metaphor belongs to the family ‘conflict’.
+    """
+
+# Create initial prompt for model to determine if a sentence contains a metaphor
+def create_metaphor_check_prompt(sentence):
+    preamble = get_preamble()
+    prompt = f"""
+    {preamble}
+    
+    Instructions:
+    Determine if the following sentence contains a metaphor. Respond with "yes" or "no" only.
+    
+    Sentence: {sentence}
+    """
+    return prompt
+
+# Create detailed prompt for model to analyze metaphors
+def create_metaphor_analysis_prompt(sentence):
+    preamble = get_preamble()
+    prompt = f"""
+    {preamble}
+    
+    Instructions:
+    Identify the target and the vehicle in the sentence.
+    Determine the context (or contexts) from which the vehicle is derived.
+    From each context, identify plausible connotations that may be carried by the vehicle.
+    Report in JSON format:
+    {{
+        "sentence": "{sentence}",
+        "target": "The target of the metaphor",
+        "vehicle": "The vehicle of the metaphor",
+        "source context": "The context from which the vehicle is derived",
+        "plausible connotations": "The connotations carried by the vehicle"
+    }}
+    """
+    return prompt
+
+# Function to call the model
+def call_model(prompt):
+    url = "http://127.0.0.1:11434/api/generate"
+    data = {
+        "model": "llama3:70b-instruct-q8_0",
+        "prompt": prompt,
+        "stream": False,
+        "temperature": 0,
+        "n_ctx": 8000,
+        "seed": 123
+    }
+    headers = {'Content-Type': 'application/json'}
+    response = requests.post(url, json=data, headers=headers)
+    if response.status_code == 200:
+        return response.json().get('response', '')
+    else:
+        logging.error(f"Failed to get valid response from the model: {response.text}")
+        return "Error in fetching response."
+
+# Create prompt for model to identify metaphor families
+def create_family_identification_prompt(source_contexts):
+    preamble = get_preamble()
+    prompt = f"""
+    {preamble}
+
+    Analyze the following source contexts of metaphors and group them into families. Each family should represent a common theme or domain from which the metaphors are drawn, such as growth, conflict, or ecology.
+
+    Source Contexts:
+    {source_contexts}
+
+    Provide the families and the contexts that belong to each family in JSON format.
+    {{
+        "families": [
+            {{
+                "family": "Family name",
+                "contexts": ["context1", "context2", ...]
+            }},
+            ...
+        ]
+    }}
+    """
+    return prompt
+
+# Create prompt for model to classify metaphors by family
+def create_classification_prompt(metaphors, families):
+    preamble = get_preamble()
+    prompt = f"""
+    {preamble}
+
+    Classify the following metaphors into the identified families. Provide the classification with a probability score (high, medium, low, not) indicating the likelihood of each metaphor belonging to each family.  
+
+    Metaphors:
+    {metaphors}
+
+    Families:
+    {families}
+
+    Provide the classification in JSON format.
+    {{
+        "classifications": [
+            {{
+                "metaphor": "Metaphor sentence",
+                "family": "Family name",
+                "probability": "Probability score"
+            }},
+            ...
+        ]
+    }}
+    """
+    return prompt
+
+# Function to extract JSON from model response
+def extract_json_from_response(response):
+    try:
+        # Extract JSON portion from the response using regular expressions
+        json_match = re.search(r'({.*})', response, re.DOTALL)
+        if json_match:
+            json_text = json_match.group(0)
+            extra_text = response.replace(json_text, '').strip()
+            logging.debug(f"Extracted JSON: {json_text}")
+            return json.loads(json_text), extra_text
+        else:
+            logging.error(f"No JSON found in response: {response}")
+            return None, response
+    except json.JSONDecodeError as e:
+        logging.error(f"JSONDecodeError: {e}. Response was: {response}")
+        return None, response
+
+# Main function to process text files and identify metaphors, then classify them
+def process_text_files_for_metaphors(folder_path, output_file):
+    data_rows = []
+    metaphors = []
+    for filename in os.listdir(folder_path):
+        if filename.endswith('.txt'):
+            txt_path = os.path.join(folder_path, filename)
+            extracted_text = extract_text_from_txt(txt_path)
+            chunks = chunk_text(extracted_text)
+            for chunk in chunks:
+                # Stage 1: Check if the sentence contains a metaphor
+                check_prompt = create_metaphor_check_prompt(chunk)
+                check_response = call_model(check_prompt).strip().lower()
+                
+                if check_response == "yes":
+                    # Stage 2: If metaphor is found, perform detailed analysis
+                    analysis_prompt = create_metaphor_analysis_prompt(chunk)
+                    analysis_response = call_model(analysis_prompt)
+                    analysis_result, extra_text = extract_json_from_response(analysis_response)
+                    if analysis_result:
+                        data_rows.append({
+                            "Filename": filename,
+                            "Sentence": analysis_result["sentence"],
+                            "Target": analysis_result["target"],
+                            "Vehicle": analysis_result["vehicle"],
+                            "Source Context": analysis_result["source context"],
+                            "Plausible Connotations": analysis_result["plausible connotations"],
+                            "Extra": extra_text
+                        })
+                        metaphors.append({
+                            "sentence": analysis_result["sentence"],
+                            "source context": analysis_result["source context"]
+                        })
+                    else:
+                        logging.debug(f"Extra text stored: {extra_text}")
+
+    # Step 3: Identify families of metaphors
+    source_contexts = [m["source context"] for m in metaphors]
+    family_prompt = create_family_identification_prompt(source_contexts)
+    family_response = call_model(family_prompt)
+    family_result, extra_text = extract_json_from_response(family_response)
+    if family_result:
+        families = family_result["families"]
+        logging.debug("Metaphor families identified")
+    else:
+        families = []
+        logging.debug(f"Extra text stored: {extra_text}")
+
+    # Step 4: Classify metaphors by family
+    classification_prompt = create_classification_prompt(metaphors, families)
+    classification_response = call_model(classification_prompt)
+    classification_result, extra_text = extract_json_from_response(classification_response)
+    if classification_result:
+        classifications = classification_result["classifications"]
+        for classification in classifications:
+            for row in data_rows:
+                if row["Sentence"] == classification["metaphor"]:
+                    row["Family"] = classification["family"]
+                    row["Probability"] = classification["probability"]
+        logging.debug("Metaphor classification completed")
+    else:
+        logging.debug(f"Extra text stored: {extra_text}")
+
+    # Output the results to CSV
+    csv_columns = ["Filename", "Sentence", "Target", "Vehicle", "Source Context", "Plausible Connotations", "Family", "Probability", "Extra"]
+    with open(output_file, 'w') as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=csv_columns)
+        writer.writeheader()
+        for row in data_rows:
+            writer.writerow(row)
+
+    logging.info("Metaphor identification and analysis complete and saved to CSV.")
+
+# Specify the paths and process the text files
+txt_folder = '/Users/peter/ai-computing-assistant/jupyter/metaphor/data'  # Path to the folder containing text files
+output_csv = '/Users/peter/ai-computing-assistant/jupyter/metaphor/output.csv'  # Path to the output CSV file
+process_text_files_for_metaphors(txt_folder, output_csv)  # Call the function to process the files
